@@ -110,6 +110,7 @@ pub use rayon_core::ThreadPool;
 pub use rayon_core::ThreadPoolBuildError;
 pub use rayon_core::ThreadPoolBuilder;
 pub use rayon_core::{BroadcastContext, broadcast, spawn_broadcast};
+pub use rayon_core::{FallbackWakeHookError, set_fallback_wake_hook};
 pub use rayon_core::{Scope, in_place_scope, scope};
 pub use rayon_core::{ScopeFifo, in_place_scope_fifo, scope_fifo};
 pub use rayon_core::{Yield, yield_local, yield_now};

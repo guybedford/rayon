@@ -14,8 +14,8 @@ use std::hash::{DefaultHasher, Hasher};
 use std::io;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Once, OnceLock};
 use std::thread;
 
 /// Thread builder used for customization via [`ThreadPoolBuilder::spawn_handler()`].
@@ -146,6 +146,16 @@ pub(super) struct Registry {
     //   These are always owned by some other job (e.g., one injected by `ThreadPool::install()`)
     //   and that job will keep the pool alive.
     terminate_count: AtomicUsize,
+
+    // Set for the global fallback when threading is unsupported: the current
+    // thread is the only worker and never runs the main loop, so spawned jobs
+    // only run when this thread next yields or blocks in Rayon.
+    fallback: bool,
+
+    // Whether the fallback wake hook has fired since the last drive; cleared
+    // whenever the worker looks for work, so the hook fires once per
+    // idle-to-pending transition.
+    fallback_wake_armed: AtomicBool,
 }
 
 // ////////////////////////////////////////////////////////////////////////
@@ -153,6 +163,70 @@ pub(super) struct Registry {
 
 static mut THE_REGISTRY: Option<Arc<Registry>> = None;
 static THE_REGISTRY_SET: Once = Once::new();
+
+type WakeHook = Box<dyn Fn() + Send + Sync>;
+
+static FALLBACK_WAKE_HOOK: OnceLock<WakeHook> = OnceLock::new();
+
+/// Error returned by [`set_fallback_wake_hook()`] when a hook is already
+/// installed. The rejected hook can be recovered with [`into_inner()`].
+///
+/// [`into_inner()`]: FallbackWakeHookError::into_inner
+pub struct FallbackWakeHookError(WakeHook);
+
+impl FallbackWakeHookError {
+    /// Returns the hook that was not installed.
+    pub fn into_inner(self) -> Box<dyn Fn() + Send + Sync> {
+        self.0
+    }
+}
+
+impl fmt::Debug for FallbackWakeHookError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FallbackWakeHookError")
+            .field(&format_args!("_"))
+            .finish()
+    }
+}
+
+impl fmt::Display for FallbackWakeHookError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("The fallback wake hook has already been installed.")
+    }
+}
+
+impl std::error::Error for FallbackWakeHookError {}
+
+/// Installs the function called when a job is queued on the global fallback
+/// registry and nothing will run it until the thread next yields to Rayon.
+///
+/// This applies only to the [global fallback when threading is unsupported]
+/// (see the crate docs), where non-blocking calls like [`spawn()`] and
+/// [`spawn_broadcast()`] can only queue their jobs. A hosted environment can
+/// use this to schedule a call to [`yield_now()`] or [`yield_local()`] on its
+/// event loop, which is the single-threaded analogue of a pool thread picking
+/// up the job. The hook is called at most once per idle-to-pending transition:
+/// after it fires, it will not fire again until the thread has yielded or
+/// blocked in Rayon.
+///
+/// The hook is called synchronously from within the spawning call, so it
+/// should only schedule work, not perform it.
+///
+/// Returns an error holding `f` if a hook is already installed.
+///
+/// [global fallback when threading is unsupported]: crate#global-fallback-when-threading-is-unsupported
+/// [`spawn()`]: crate::spawn()
+/// [`spawn_broadcast()`]: crate::spawn_broadcast()
+/// [`yield_now()`]: crate::yield_now()
+/// [`yield_local()`]: crate::yield_local()
+pub fn set_fallback_wake_hook<F>(f: F) -> Result<(), FallbackWakeHookError>
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    FALLBACK_WAKE_HOOK
+        .set(Box::new(f))
+        .map_err(FallbackWakeHookError)
+}
 
 /// Starts the worker threads (if that has not already happened). If
 /// initialization has not already occurred, use the default
@@ -208,15 +282,16 @@ fn default_global_registry() -> Result<Arc<Registry>, ThreadPoolBuildError> {
     let result = Registry::new(ThreadPoolBuilder::new());
 
     // If we're running in an environment that doesn't support threads at all, we can fall back to
-    // using the current thread alone. This is crude, and probably won't work for non-blocking
-    // calls like `spawn` or `broadcast_spawn`, but a lot of stuff does work fine.
+    // using the current thread alone. This is crude, and non-blocking calls like `spawn` or
+    // `spawn_broadcast` can only queue their jobs until the thread yields to Rayon (see
+    // `set_fallback_wake_hook`), but a lot of stuff does work fine.
     //
     // Notably, this allows current WebAssembly targets to work even though their threading support
     // is stubbed out, and we won't have to change anything if they do add real threading.
     let unsupported = matches!(&result, Err(e) if e.is_unsupported());
     if unsupported && WorkerThread::current().is_null() {
         let builder = ThreadPoolBuilder::new().num_threads(1).use_current_thread();
-        let fallback_result = Registry::new(builder);
+        let fallback_result = Registry::new_fallback(builder);
         if fallback_result.is_ok() {
             return fallback_result;
         }
@@ -234,8 +309,28 @@ impl<'a> Drop for Terminator<'a> {
 }
 
 impl Registry {
-    pub(super) fn new<S>(
+    pub(super) fn new<S>(builder: ThreadPoolBuilder<S>) -> Result<Arc<Self>, ThreadPoolBuildError>
+    where
+        S: ThreadSpawn,
+    {
+        Self::new_inner(builder, false)
+    }
+
+    /// Creates the single-threaded fallback registry that takes over the
+    /// current thread; `builder` must be `num_threads(1).use_current_thread()`.
+    pub(super) fn new_fallback<S>(
+        builder: ThreadPoolBuilder<S>,
+    ) -> Result<Arc<Self>, ThreadPoolBuildError>
+    where
+        S: ThreadSpawn,
+    {
+        debug_assert!(builder.use_current_thread && builder.get_num_threads() == 1);
+        Self::new_inner(builder, true)
+    }
+
+    fn new_inner<S>(
         mut builder: ThreadPoolBuilder<S>,
+        fallback: bool,
     ) -> Result<Arc<Self>, ThreadPoolBuildError>
     where
         S: ThreadSpawn,
@@ -275,6 +370,8 @@ impl Registry {
             panic_handler: builder.take_panic_handler(),
             start_handler: builder.take_start_handler(),
             exit_handler: builder.take_exit_handler(),
+            fallback,
+            fallback_wake_armed: AtomicBool::new(false),
         });
 
         // If we return early or panic, make sure to terminate existing threads.
@@ -603,6 +700,25 @@ impl Registry {
     pub(super) fn notify_worker_latch_is_set(&self, target_worker_index: usize) {
         self.sleep.notify_worker_latch_is_set(target_worker_index);
     }
+
+    /// Called after queueing a job that nothing will run until the thread
+    /// yields to Rayon. In the fallback registry this fires the wake hook,
+    /// coalesced until the next drive. A no-op for normal registries.
+    pub(super) fn fallback_wake(&self) {
+        if self.fallback && !self.fallback_wake_armed.swap(true, Ordering::AcqRel) {
+            if let Some(hook) = FALLBACK_WAKE_HOOK.get() {
+                hook();
+            }
+        }
+    }
+
+    /// Consumes any pending wake, so the next queued job fires the hook again.
+    #[inline]
+    fn fallback_wake_consumed(&self) {
+        if self.fallback {
+            self.fallback_wake_armed.store(false, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -833,6 +949,8 @@ impl WorkerThread {
     }
 
     fn find_work(&self) -> Option<JobRef> {
+        self.registry.fallback_wake_consumed();
+
         // Try to find some work to do. We give preference first
         // to things in our local deque, then in other workers
         // deques, and finally to injected jobs from the
@@ -854,6 +972,7 @@ impl WorkerThread {
     }
 
     pub(super) fn yield_local(&self) -> Yield {
+        self.registry.fallback_wake_consumed();
         match self.take_local_job() {
             Some(job) => unsafe {
                 self.execute(job);

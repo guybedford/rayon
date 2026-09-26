@@ -149,4 +149,5 @@ where
     });
 
     registry.inject_broadcast(job_refs);
+    registry.fallback_wake();
 }

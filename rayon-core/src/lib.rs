@@ -29,10 +29,17 @@
 //! This fallback mode mostly functions as if it were using a single-threaded "pool", like setting
 //! `RAYON_NUM_THREADS=1`. For example, `join` will execute its two closures sequentially, since
 //! there is no other thread to share the work. However, since the pool is not running independent
-//! of the main thread, non-blocking calls like `spawn` may not execute at all, unless a lower-
-//! priority call like `broadcast` gives them an opening. The fallback mode does not try to emulate
-//! anything like thread preemption or `async` task switching, but `yield_now` or `yield_local`
-//! can also volunteer execution time.
+//! of the main thread, non-blocking calls like `spawn` and `spawn_broadcast` only queue their
+//! jobs. Those run when the thread volunteers execution time with `yield_now` or `yield_local`,
+//! and may also be picked up while the thread is blocked in Rayon (`join`, `scope`, `broadcast`,
+//! etc.) waiting for other work. Nothing runs inside the `spawn` call itself, and the fallback
+//! mode does not try to emulate anything like thread preemption or `async` task switching.
+//!
+//! A hosted environment with its own event loop can install [`set_fallback_wake_hook()`] to be
+//! told when jobs have been queued, and schedule a `yield_now` loop on that event loop (e.g. with
+//! `queueMicrotask` on the web). This is the single-threaded analogue of a pool thread picking up
+//! the job. `yield_now` runs one job per call and reports whether it did, so the host can bound
+//! how much it runs per turn.
 //!
 //! Explicit `ThreadPoolBuilder` methods always report their error without any fallback.
 //!
@@ -83,6 +90,7 @@ mod test;
 pub use self::broadcast::{BroadcastContext, broadcast, spawn_broadcast};
 pub use self::join::{join, join_context};
 pub use self::registry::ThreadBuilder;
+pub use self::registry::{FallbackWakeHookError, set_fallback_wake_hook};
 pub use self::scope::{Scope, in_place_scope, scope};
 pub use self::scope::{ScopeFifo, in_place_scope_fifo, scope_fifo};
 pub use self::spawn::{spawn, spawn_fifo};

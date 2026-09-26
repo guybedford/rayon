@@ -79,6 +79,7 @@ where
     let job_ref = unsafe { spawn_job(func, registry) };
     registry.inject_or_push(job_ref);
     mem::forget(abort_guard);
+    registry.fallback_wake();
 }
 
 unsafe fn spawn_job<F>(func: F, registry: &Arc<Registry>) -> JobRef
@@ -157,6 +158,7 @@ where
         None => registry.inject(job_ref),
     }
     mem::forget(abort_guard);
+    registry.fallback_wake();
 }
 
 #[cfg(test)]
