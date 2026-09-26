@@ -36,10 +36,12 @@
 //! mode does not try to emulate anything like thread preemption or `async` task switching.
 //!
 //! A hosted environment with its own event loop can install [`set_fallback_wake_hook()`] to be
-//! told when jobs have been queued, and schedule a `yield_now` loop on that event loop (e.g. with
+//! told when jobs have been queued, and schedule a drive on that event loop (e.g. with
 //! `queueMicrotask` on the web). This is the single-threaded analogue of a pool thread picking up
-//! the job. `yield_now` runs one job per call and reports whether it did, so the host can bound
-//! how much it runs per turn.
+//! the job. The hook fires once and is then quiet until the thread next yields or blocks in Rayon,
+//! so a drive must loop calling `yield_now` until it returns `Yield::Idle` rather than yielding
+//! once per wake. `yield_now` runs one job per call, so the host can bound the work per turn, but
+//! it must then reschedule itself if the bound is reached before `Idle`.
 //!
 //! Explicit `ThreadPoolBuilder` methods always report their error without any fallback.
 //!

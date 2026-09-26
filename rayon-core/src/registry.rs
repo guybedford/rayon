@@ -203,11 +203,16 @@ impl std::error::Error for FallbackWakeHookError {}
 /// This applies only to the [global fallback when threading is unsupported]
 /// (see the crate docs), where non-blocking calls like [`spawn()`] and
 /// [`spawn_broadcast()`] can only queue their jobs. A hosted environment can
-/// use this to schedule a call to [`yield_now()`] or [`yield_local()`] on its
-/// event loop, which is the single-threaded analogue of a pool thread picking
-/// up the job. The hook is called at most once per idle-to-pending transition:
-/// after it fires, it will not fire again until the thread has yielded or
-/// blocked in Rayon.
+/// use this to schedule a drive of the queue on its event loop, which is the
+/// single-threaded analogue of a pool thread picking up the job.
+///
+/// The hook is coalesced: it fires when a job is queued and then not again
+/// until the thread has yielded or blocked in Rayon, however many further jobs
+/// are queued in between. A drive must therefore call [`yield_now()`] (or
+/// [`yield_local()`]) repeatedly until it returns [`Yield::Idle`], not just
+/// once per wake. A host that bounds the work per turn must reschedule itself
+/// when the bound is reached before `Idle`, since the remaining jobs will not
+/// wake it again.
 ///
 /// The hook is called synchronously from within the spawning call, so it
 /// should only schedule work, not perform it.
@@ -219,6 +224,7 @@ impl std::error::Error for FallbackWakeHookError {}
 /// [`spawn_broadcast()`]: crate::spawn_broadcast()
 /// [`yield_now()`]: crate::yield_now()
 /// [`yield_local()`]: crate::yield_local()
+/// [`Yield::Idle`]: crate::Yield::Idle
 pub fn set_fallback_wake_hook<F>(f: F) -> Result<(), FallbackWakeHookError>
 where
     F: Fn() + Send + Sync + 'static,

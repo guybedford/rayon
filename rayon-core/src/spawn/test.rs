@@ -298,6 +298,18 @@ mod fallback {
             .count()
     }
 
+    /// A host loop: keep taking turns while woken, or while the previous turn hit its
+    /// budget before going idle (the remaining jobs will not wake again). Returns turns.
+    fn host_loop(budget: usize) -> usize {
+        let mut turns = 0;
+        let mut rescheduled = false;
+        while take_wakes() > 0 || rescheduled {
+            turns += 1;
+            rescheduled = drive(budget) == budget;
+        }
+        turns
+    }
+
     #[test]
     #[cfg_attr(any(target_os = "emscripten", target_family = "wasm"), ignore)]
     fn spawn_only_queues() {
@@ -365,12 +377,7 @@ mod fallback {
             });
             assert!(rx.try_recv().is_err());
 
-            let mut turns = 0;
-            while take_wakes() > 0 {
-                turns += 1;
-                drive(usize::MAX);
-            }
-            assert_eq!(turns, 1);
+            assert_eq!(host_loop(usize::MAX), 1);
             let mut ran: Vec<_> = rx.try_iter().collect();
             ran.sort();
             assert_eq!(ran, ["spawn", "spawn_broadcast", "spawn_fifo"]);
@@ -417,11 +424,7 @@ mod fallback {
 
             // Each turn runs at most BUDGET jobs; the chain re-wakes itself so the
             // host keeps scheduling turns until it goes quiet.
-            let mut turns = 0;
-            while take_wakes() > 0 {
-                turns += 1;
-                assert!(drive(BUDGET) <= BUDGET);
-            }
+            let turns = host_loop(BUDGET);
             assert_eq!(rx.try_recv(), Ok(()));
             // Jobs run in the final turn still wake, so the host takes one idle turn to notice.
             assert_eq!(turns, DEPTH.div_ceil(BUDGET) + 1);
@@ -453,6 +456,33 @@ mod fallback {
             spawn(|| {});
             assert_eq!(take_wakes(), 1);
             drive(usize::MAX);
+        });
+    }
+
+    #[test]
+    #[cfg_attr(any(target_os = "emscripten", target_family = "wasm"), ignore)]
+    fn burst_of_spawns_wakes_once_and_needs_draining() {
+        in_fallback_registry(|| {
+            const JOBS: usize = 200;
+            const BUDGET: usize = 64;
+            let (tx, rx) = channel();
+            for i in 0..JOBS {
+                let tx = tx.clone();
+                spawn(move || tx.send(i).unwrap());
+            }
+            assert_eq!(wakes(), 1, "queued jobs after the first produce no wake");
+
+            // A host that yields once per wake would orphan the rest.
+            assert_eq!(yield_now(), Some(Yield::Executed));
+            assert_eq!(rx.try_iter().count(), 1);
+            assert_eq!(wakes(), 1);
+
+            // A bounded host must reschedule itself when it hits its budget before Idle.
+            let turns = host_loop(BUDGET);
+            assert_eq!(rx.try_iter().count(), JOBS - 1);
+            // Unlike a spawn chain, nothing here re-wakes, so the last turn reaches Idle directly.
+            assert_eq!(turns, (JOBS - 1).div_ceil(BUDGET));
+            assert_eq!(yield_now(), Some(Yield::Idle));
         });
     }
 }
